@@ -1,0 +1,34 @@
+model_name: firefly_tilt
+control_rate: 100
+motor_num: 6
+inertia: [0.0347563, 0.0458929, 0.0977]
+kp: [6, 6, 6]
+kd: [4.7, 4.7, 4.7]
+attitude_gain: [3.0, 3.0, 0.15]
+angular_rate_gain: [0.52, 0.52, 0.18]
+mass: 1.5
+gravity: 9.81
+motor_force_k: 8.54858e-6
+motor_moment_k: 1.6e-2
+rotor_angles: [0.52359877559, 1.57079632679, 2.61799387799, -2.6179938779, -1.5707963267, -0.5235987755]
+arm_length:  [0.215, 0.215, 0.215, 0.215, 0.215, 0.215]
+motor_rotation_direction: [1, -1, 1, -1, 1, -1]
+test_motors: False
+
+ref_jerk_max: 10.0
+ref_acc_max: 1.0
+ref_vel_max: 0.8
+ref_omega: 1.0
+ref_zita: 0.95
+
+ref_o_jerk_max: 2.0
+ref_o_acc_max: 0.8
+ref_o_vel_max: 0.25
+
+
+save_logs: false
+
+ext_zita: 1.0
+ext_omega_lin: 15.0
+ext_omega_tor: 15.0
+ext_omega_z: 15.0
