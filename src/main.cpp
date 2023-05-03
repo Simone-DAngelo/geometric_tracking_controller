@@ -256,9 +256,9 @@ CONTROLLER::CONTROLLER() : Node("lee_controller"), _first_odom(false), _new_plan
     });
 
     // _cmd_vel_motor_pub = this->create_publisher<std_msgs::msg::Float32MultiArray>(_model_name + "/cmd/motor_vel", 0);
-    _vehicle_thrust_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/in/vehicle_thrust_setpoint", 0);
-    _vehicle_torque_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", 0);
-    _vehicle_command_publisher = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 0);
+    _vehicle_thrust_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/vehicle_thrust_setpoint/in", 0);
+    _vehicle_torque_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/vehicle_torque_setpoint/in", 0);
+    _vehicle_command_publisher = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/vehicle_command/in", 0);
     //----------------
     _cmd_p << 0.0, 0.0, 0.0;
     _cmd_dp << 0.0, 0.0, 0.0;
