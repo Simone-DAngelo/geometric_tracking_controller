@@ -1,18 +1,18 @@
 lee_controller:
   ros__parameters:
     model_name: "iris"
-    control_rate: 1000.0
-    rate: 500.0         
+    control_rate: 100.0
+    rate: 100.0         
     motor_num: 4
     inertia: [0.0347563, 0.0458929, 0.0977]
     # kp: [15.0, 15.0, 15.0]
     # kd: [5.7, 5.7, 5.7]
     # attitude_gain: [2.0, 3.0, 0.15]
     # angular_rate_gain: [0.4, 0.52, 0.18]
-    kp: [5.5, 5.5, 30.0]                            #<--px4 kz=15
-    kd: [1.8, 1.8, 8.0]                             #<--px4
-    attitude_gain: [0.2, 0.2, 0.3]                  #<--px4
-    angular_rate_gain: [0.1, 0.1, 0.3]              #<--px4
+    kp: [7.0,7.0,6.0]                            #<--px4 kz=15
+    kd: [6.0, 6.0, 3.0]                             #<--px4
+    attitude_gain: [3.0, 3.0, 0.15]                  #<--px4
+    angular_rate_gain: [0.5, 0.5, 0.18]              #<--px4
     mass: 1.515
     gravity: 9.81
     # motor_force_k: 8.54858e-06
@@ -26,30 +26,14 @@ lee_controller:
     
     motor_rotation_direction: [1.0, 1.0, -1.0, -1.0]
 
-    # ref_jerk_max: 10.0
-    # ref_acc_max: 2.5
-    # ref_vel_max: 2.0
-    # ref_omega: 1.0
-    # ref_zita: 0.75
+    ref_jerk_max: 10.0
+    ref_acc_max: 2.5
+    ref_vel_max: 2.0
+    ref_omega: 1.0
+    ref_zita: 0.75
 
-    # ref_o_jerk_max: 2.0
-    # ref_o_acc_max: 0.8
-    # ref_o_vel_max: 0.05
-
-    # # ref_jerk_max: 1.5
-    # # ref_acc_max: 0.8
-    # # ref_vel_max: 0.5
-    # # ref_omega: 1.0
-    # # ref_zita: 0.75
-
-    ref_jerk_max: 1.5
-    ref_acc_max: 0.5
-    ref_vel_max: 0.2
-    ref_omega: 0.1
-    ref_zita: 1.0
-
-    ref_o_jerk_max: 1.0
-    ref_o_acc_max: 0.5
-    ref_o_vel_max: 0.02
+    ref_o_jerk_max: 2.0
+    ref_o_acc_max: 0.8
+    ref_o_vel_max: 0.05
 
 
