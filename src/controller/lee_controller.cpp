@@ -5,7 +5,8 @@ using namespace std;
 LEE_CONTROLLER::LEE_CONTROLLER() {}
 
 void LEE_CONTROLLER::set_allocation_matrix(  Eigen::MatrixXd allocation_M ) {
-  _wd2rpm = allocation_M.transpose() * (allocation_M*allocation_M.transpose()).inverse();//*_I;    
+  // _wd2rpm = allocation_M.transpose() * (allocation_M*allocation_M.transpose()).inverse();//*_I;   
+  _wd2rpm =  allocation_M.inverse();
 }
 
 void LEE_CONTROLLER::set_uav_dynamics (int motor_num, double mass, double gravity, Eigen::Matrix4d I) {
@@ -33,8 +34,8 @@ void LEE_CONTROLLER::controller(    Eigen::Vector3d mes_p,
                                     Eigen::Vector3d mes_w,
                                     Eigen::VectorXd* rotor_velocities,
                                     Eigen::Vector4d* ft,
-                                    Eigen::Vector3d* perror,
-                                    Eigen::Vector3d* verror,
+                                    Eigen::Vector3d* p_error,
+                                    Eigen::Vector3d* v_error,
                                     Eigen::Vector3d* att_error ) {
 
                                       
@@ -107,7 +108,7 @@ void LEE_CONTROLLER::controller(    Eigen::Vector3d mes_p,
     *rotor_velocities = rotor_velocities->cwiseMax(Eigen::VectorXd::Zero(rotor_velocities->rows()));
     *rotor_velocities = rotor_velocities->cwiseSqrt();
 
-    *perror = position_error;
-    *verror = velocity_error;
+    *p_error = position_error;
+    *v_error = velocity_error;
       
 }

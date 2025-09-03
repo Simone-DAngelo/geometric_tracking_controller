@@ -1,0 +1,41 @@
+geometric_tracking_controller:
+  ros__parameters:
+    use_sim_time: true
+    
+    model_name: "fpv_drone"
+    namespace: "quadrotor"
+    
+    control_rate: 100.0
+    rate: 100.0
+    
+    motor_num: 4
+    mass: 0.8704
+    gravity: 9.81
+    inertia: [0.008951, 0.003102, 0.01161]
+
+    kp: [7.0, 7.0, 6.0]
+    kd: [3.0, 3.0, 3.0]
+    attitude_gain: [0.4, 0.2, 0.15]
+    angular_rate_gain: [0.15, 0.05, 0.18]
+
+    # rotor_angles: [0.615, 3.975, -0.615, 2.308]
+    rotor_angles: [-0.615, 2.308, 0.615, 3.975]
+    arm_length: [0.1814, 0.1815, 0.1814, 0.1815]
+    motor_rotation_direction: [1.0, 1.0, -1.0, -1.0]
+    motor_force_k: 5.84e-06
+    motor_moment_k: 0.6e-2
+    max_motor_velocity: 1885.0
+    rotor_drag_coefficient: 1.0e-7
+    time_constant_up: 0.02
+    time_constant_down: 0.04
+    
+    ref_jerk_max: 0.4
+    ref_acc_max: 0.25
+    ref_vel_max: 0.5
+
+    ref_omega: 1.5
+    ref_zita: 1.0
+
+    ref_o_jerk_max: 2.0
+    ref_o_acc_max: 1.5
+    ref_o_vel_max: 1.0

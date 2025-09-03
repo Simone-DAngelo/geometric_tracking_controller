@@ -3,18 +3,18 @@
 
 #include "boost/thread.hpp"
 #include <Eigen/Eigen>
+#include <algorithm>
 
 #include "std_msgs/msg/float32_multi_array.hpp"
-#include "px4_msgs/msg/vehicle_odometry.hpp"
-#include "px4_msgs/msg/vehicle_thrust_setpoint.hpp"
-#include "px4_msgs/msg/vehicle_torque_setpoint.hpp"
-#include "px4_msgs/msg/vehicle_command.hpp"
-#include "px4_msgs/msg/offboard_control_mode.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "geometry_msgs/msg/wrench_stamped.hpp"
+#include "actuator_msgs/msg/actuators.hpp"
 
 #include "utils.h"
 
 #include <cstdio>
 #include <chrono>
+#include <cmath>
 
 using namespace std::chrono_literals;
 using namespace std;
@@ -28,31 +28,28 @@ class CONTROLLER : public rclcpp::Node {
         void run();
         void ctrl_loop();
         void request_new_plan();
-        bool get_allocation_matrix(Eigen::MatrixXd & allocation_M, int motor_size );
         void ffilter();
-        void arm();
-        void disarm();
 
     private:
-        void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
-        void publish_thrust_setpoint(float thrust);
-        void publish_torque_setpoint(Eigen::Vector3d torque);
-        void publish_offboard_control_mode();
+        void publish_motor_commands(const Eigen::VectorXd& motor_velocities);
         void timerCallback();
+        void odom_callback(const nav_msgs::msg::Odometry& msg);
 
         rclcpp::TimerBase::SharedPtr timer_;
 
-        rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr _odom_sub;
-        
-        rclcpp::Publisher<px4_msgs::msg::VehicleThrustSetpoint>::SharedPtr _vehicle_thrust_sp_publisher; 
-        rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr _vehicle_torque_sp_publisher; 
-        rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr _offboard_control_mode_publisher;
-	    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr _vehicle_command_publisher;
+        // Subscriptions - using standard ROS2 messages
+        rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _odom_sub;
+
+        // Publishers - using actuator messages for motor control
+        rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr _motor_command_publisher;
 
         bool _first_odom, _new_plan;
+        bool _controller_initialized;
+        bool _auto_hover_enabled;  // New flag to enable automatic hovering at initial position
 
         //---Parameters
         string _model_name;
+        string _namespace;
         double _ctrl_rate;
         int _motor_num;
         Eigen::Matrix3d _inertia;
@@ -67,8 +64,12 @@ class CONTROLLER : public rclcpp::Node {
         vector<double> _arm_length;
         double _motor_force_k;
         double _motor_moment_k;
-        vector<int> _motor_rotation_direction;
-        
+        double _max_motor_velocity;
+        double _rotor_drag_coefficient;
+        double _time_constant_up;
+        double _time_constant_down;
+        vector<double> _motor_rotation_direction;
+
         double _ref_jerk_max;
         double _ref_acc_max;
         double _ref_omega;
@@ -78,6 +79,7 @@ class CONTROLLER : public rclcpp::Node {
         double _ref_o_acc_max;
         double _ref_o_vel_max;
         double _ref_vel_max;
+
         //---
         Eigen::Vector3d _perror;
         Eigen::Vector3d _verror;
@@ -100,25 +102,22 @@ class CONTROLLER : public rclcpp::Node {
         Eigen::Vector3d _mes_p;
         Eigen::Vector3d _mes_dp;
         Eigen::Vector3d _omega_mes;
+        Eigen::Matrix3d _R_mes;
 
-        float _thrust_normalized;
         float _max_thrust;
-        Eigen::Vector3d _torque_normalized;
-        Eigen::Vector4d _max_wrench, _max_rot_speed;
         bool _armed;
 };
 
-CONTROLLER::CONTROLLER() : Node("lee_controller"), _first_odom(false), _new_plan(false) {
+CONTROLLER::CONTROLLER() : Node("geometric_tracking_controller"), _first_odom(false), _new_plan(false), _controller_initialized(false), _auto_hover_enabled(false) {
     
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(10),
+        std::chrono::milliseconds(10), 
         std::bind(&CONTROLLER::timerCallback, this));
 
-    // Get param from file yaml --------------------------------------- 
     declare_parameter("model_name","uav");
-    declare_parameter("control_rate",0.0);
-    declare_parameter("rate",0.0);
-    declare_parameter("motor_num",0);
+    declare_parameter("control_rate",100.0);
+    declare_parameter("rate",100.0);
+    declare_parameter("motor_num",4);
     declare_parameter("inertia",std::vector<double>(3, 1));
     declare_parameter("kp",std::vector<double>(3, 1));
     declare_parameter("kd",std::vector<double>(3, 1));
@@ -128,9 +127,13 @@ CONTROLLER::CONTROLLER() : Node("lee_controller"), _first_odom(false), _new_plan
     declare_parameter("gravity",0.0);
     declare_parameter("motor_force_k",0.0);
     declare_parameter("motor_moment_k",0.0);
-    declare_parameter("rotor_angles",std::vector<double>(4, 1));
-    declare_parameter("arm_length",std::vector<double>(4, 1));
-    declare_parameter("motor_rotation_direction",std::vector<double>(4, 1));
+    declare_parameter("max_motor_velocity", 0.0);
+    declare_parameter("rotor_drag_coefficient", 0.0);
+    declare_parameter("time_constant_up", 0.0);
+    declare_parameter("time_constant_down", 0.0);
+    declare_parameter("rotor_angles",std::vector<double>(4, 1.0));
+    declare_parameter("arm_length",std::vector<double>(4, 1.0));
+    declare_parameter("motor_rotation_direction",std::vector<double>(4, 1.0));
     declare_parameter("ref_jerk_max",0.0);
     declare_parameter("ref_acc_max",0.0);
     declare_parameter("ref_vel_max",0.0);
@@ -140,81 +143,89 @@ CONTROLLER::CONTROLLER() : Node("lee_controller"), _first_odom(false), _new_plan
     declare_parameter("ref_o_acc_max",0.0);
     declare_parameter("ref_o_vel_max",0.0);
 
-    auto _mod_name = get_parameter("model_name").as_string();
-    auto _rate_c = get_parameter("control_rate").as_double();
-    auto _rate2_c = get_parameter("rate").as_double();
-    auto _mot_num = get_parameter("motor_num").as_int();
-    auto _iner = get_parameter("inertia").as_double_array();
-    auto _k_p = get_parameter("kp").as_double_array();
-    auto _k_d = get_parameter("kd").as_double_array();
-    auto _att_gain = get_parameter("attitude_gain").as_double_array();
-    auto _ang_rate_gain = get_parameter("angular_rate_gain").as_double_array();
-    auto _m = get_parameter("mass").as_double();
-    auto _grav = get_parameter("gravity").as_double();
-    auto _mot_force_k = get_parameter("motor_force_k").as_double();
-    auto _mot_moment_k = get_parameter("motor_moment_k").as_double();
-    auto _rot_angles = get_parameter("rotor_angles").as_double_array();
-    auto _arm_l = get_parameter("arm_length").as_double_array();
-    auto _m_rot_dir = get_parameter("motor_rotation_direction").as_double_array();
-    auto _refjerk_max = get_parameter("ref_jerk_max").as_double();
-    auto _refacc_max = get_parameter("ref_acc_max").as_double();
-    auto _refvel_max = get_parameter("ref_vel_max").as_double();
-    auto _refomega = get_parameter("ref_omega").as_double();
-    auto _refzita = get_parameter("ref_zita").as_double();
-    auto _refo_jerk_max = get_parameter("ref_o_jerk_max").as_double();
-    auto _refo_acc_max = get_parameter("ref_o_acc_max").as_double();
-    auto _refo_vel_max = get_parameter("ref_o_vel_max").as_double();
+    auto mod_name = get_parameter("model_name").as_string();
+    auto rate_c = get_parameter("control_rate").as_double();
+    auto rate2_c = get_parameter("rate").as_double();
+    auto mot_num = get_parameter("motor_num").as_int();
+    auto iner = get_parameter("inertia").as_double_array();
+    auto k_p = get_parameter("kp").as_double_array();
+    auto k_d = get_parameter("kd").as_double_array();
+    auto att_gain = get_parameter("attitude_gain").as_double_array();
+    auto ang_rate_gain = get_parameter("angular_rate_gain").as_double_array();
+    auto m = get_parameter("mass").as_double();
+    auto grav = get_parameter("gravity").as_double();
+    auto mot_force_k = get_parameter("motor_force_k").as_double();
+    auto mot_moment_k = get_parameter("motor_moment_k").as_double();
+    auto max_mot_vel = get_parameter("max_motor_velocity").as_double();
+    auto rotor_drag_coeff = get_parameter("rotor_drag_coefficient").as_double();
+    auto time_const_up = get_parameter("time_constant_up").as_double();
+    auto time_const_down = get_parameter("time_constant_down").as_double();
+    auto rot_angles = get_parameter("rotor_angles").as_double_array();
+    auto arm_l = get_parameter("arm_length").as_double_array();
+    auto m_rot_dir = get_parameter("motor_rotation_direction").as_double_array();
+    auto refjerk_max = get_parameter("ref_jerk_max").as_double();
+    auto refacc_max = get_parameter("ref_acc_max").as_double();
+    auto refvel_max = get_parameter("ref_vel_max").as_double();
+    auto refomega = get_parameter("ref_omega").as_double();
+    auto refzita = get_parameter("ref_zita").as_double();
+    auto refo_jerk_max = get_parameter("ref_o_jerk_max").as_double();
+    auto refo_acc_max = get_parameter("ref_o_acc_max").as_double();
+    auto refo_vel_max = get_parameter("ref_o_vel_max").as_double();
 
-    _model_name = _mod_name;
-    _ctrl_rate = _rate_c;
-    _rate = _rate2_c;
-    _motor_num = _mot_num;
-    _inertia = Eigen::Matrix3d( Eigen::Vector3d( _iner[0], _iner[1], _iner[2] ).asDiagonal() );
-    _position_gain = Eigen::Vector3d( _k_p[0], _k_p[1], _k_p[2] );
-    _velocity_gain = Eigen::Vector3d( _k_d[0], _k_d[1], _k_d[2] );
-    _attitude_gain = Eigen::Vector3d(_att_gain[0], _att_gain[1], _att_gain[2]);
-    _angular_rate_gain = Eigen::Vector3d(_ang_rate_gain[0],_ang_rate_gain[1],_ang_rate_gain[2]);
-    _mass = _m;
-    _gravity = _grav;
+    _model_name = mod_name;
+    _ctrl_rate = rate_c;
+    _rate = rate2_c;
+    _motor_num = mot_num;
+    _inertia = Eigen::Matrix3d( Eigen::Vector3d( iner[0], iner[1], iner[2] ).asDiagonal() );
+    _position_gain = Eigen::Vector3d( k_p[0], k_p[1], k_p[2] );
+    _velocity_gain = Eigen::Vector3d( k_d[0], k_d[1], k_d[2] );
+    _attitude_gain = Eigen::Vector3d(att_gain[0], att_gain[1], att_gain[2]);
+    _angular_rate_gain = Eigen::Vector3d(ang_rate_gain[0],ang_rate_gain[1],ang_rate_gain[2]);
+    _mass = m;
+    _gravity = grav;
     _rotor_angles.resize( _motor_num );
     _arm_length.resize( _motor_num );
     _motor_rotation_direction.resize( _motor_num );
     for(int i=0;i<_motor_num;i++){
-        _rotor_angles[i] =_rot_angles[i];
-        _arm_length[i] = _arm_l[i];
-        _motor_rotation_direction[i] = _m_rot_dir[i];
+        _rotor_angles[i] = rot_angles[i];
+        _arm_length[i] = arm_l[i];
+        _motor_rotation_direction[i] = m_rot_dir[i];
     }
-    _motor_force_k = _mot_force_k;
-    _motor_moment_k = _mot_moment_k;
-    _ref_jerk_max = _refjerk_max;
-    _ref_acc_max = _refacc_max;
-    _ref_omega = _refomega;
-    _ref_zita = _refzita;
+    _motor_force_k = mot_force_k;
+    _motor_moment_k = mot_moment_k;
+    _max_motor_velocity = max_mot_vel;
+    _rotor_drag_coefficient = rotor_drag_coeff;
+    _time_constant_up = time_const_up;
+    _time_constant_down = time_const_down;
+    _ref_jerk_max = refjerk_max;
+    _ref_acc_max = refacc_max;
+    _ref_omega = refomega;
+    _ref_zita = refzita;
 
-    _ref_o_jerk_max = _refo_jerk_max;
-    _ref_o_acc_max = _refo_acc_max;
-    _ref_o_vel_max = _refo_vel_max;
-    _ref_vel_max = _refvel_max;
+    _ref_o_jerk_max = refo_jerk_max;
+    _ref_o_acc_max = refo_acc_max;
+    _ref_o_vel_max = refo_vel_max;
+    _ref_vel_max = refvel_max;
 
-    // ROS2 pub/sub
+    // ROS2 pub/sub with namespace support
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
 	auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
     
-    _odom_sub = this->create_subscription<px4_msgs::msg::VehicleOdometry>("/fmu/out/vehicle_odometry", qos, 
-    [this](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) -> void {
-        _mes_p << msg->position[0], msg->position[1], msg->position[2];
-        _mes_dp << msg->velocity[0], msg->velocity[1], msg->velocity[2];
-        _att_q << msg->q[0], msg->q[1], msg->q[2], msg->q[3];
-        _omega_mes << msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2];
-        _first_odom = true;
-    });
+    // Get namespace parameter for topic mapping
+    declare_parameter("namespace", "quadrotor");  // Default to match SDF robotNamespace
+    _namespace = this->get_parameter("namespace").as_string();
+    
+    // Ground-truth odometry from frame converter (already in FRD frame)
+    std::string odom_topic = "/quadrotor/odometry_frd";
+    _odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, qos, 
+        std::bind(&CONTROLLER::odom_callback, this, std::placeholders::_1));
 
-    _vehicle_thrust_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/in/vehicle_thrust_setpoint", 0);
-    _vehicle_torque_sp_publisher = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", 0);
-    _vehicle_command_publisher = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 0);
-    _offboard_control_mode_publisher = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 0);
+    std::string motor_topic = "/" + _namespace + "/gazebo/command/motor_speed";
+    _motor_command_publisher = this->create_publisher<actuator_msgs::msg::Actuators>(motor_topic, 10);
 
-    _cmd_p << 0.0, 0.0, 0.0;
+    RCLCPP_INFO(this->get_logger(), "Controller initialized: %s → %s", odom_topic.c_str(), motor_topic.c_str());
+
+    _cmd_p << 0.0, 0.0, 0.0;      // Start with zero command - wait for user input
     _cmd_dp << 0.0, 0.0, 0.0;
     _cmd_ddp << 0.0, 0.0, 0.0;
     _ref_yaw = 0.0;
@@ -223,131 +234,119 @@ CONTROLLER::CONTROLLER() : Node("lee_controller"), _first_odom(false), _new_plan
     for(int i=0; i<_motor_num; i++ )
       _omega_motor[i] = 0.0; 
 
-    _thrust_normalized = 0.0;
-    _max_thrust = 2*_mass*_gravity;
-    _torque_normalized << 0,0,0;  
-    _max_rot_speed << pow(1100,2), pow(1100,2), pow(1100,2), pow(1100,2);
     _armed = false;
+    _new_plan = false;  // Initialize with no active plan
+
+    _mes_p.setZero();
+    _mes_dp.setZero();
+    _omega_mes.setZero();
+    _R_mes.setIdentity();
+    _Eta.setZero();
+    _max_thrust = 2 * _mass * 9.81;  // Max thrust is mass * gravity
+}
+
+void CONTROLLER::odom_callback(const nav_msgs::msg::Odometry& msg) {
+
+    _mes_p << msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z;
+    _mes_dp << msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z;
+    _omega_mes << msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z;
+    
+    _att_q << msg.pose.pose.orientation.w, msg.pose.pose.orientation.x, 
+              msg.pose.pose.orientation.y, msg.pose.pose.orientation.z;
+    
+    _R_mes = utilities::QuatToMat(_att_q);
+    _Eta = utilities::MatToRpy(_R_mes);
+    
+    // AUTO-HOVER initialization
+    if(!_first_odom && !_auto_hover_enabled) {
+        _cmd_p = _mes_p;
+        _ref_yaw = _Eta(2);
+        _yaw_cmd = _Eta(2);
+        _auto_hover_enabled = true;
+        RCLCPP_INFO(this->get_logger(), "Auto-hover enabled at [%.3f, %.3f, %.3f]", 
+                   _cmd_p[0], _cmd_p[1], _cmd_p[2]);
+    }
+    
+    _first_odom = true;
 }
 
 void CONTROLLER::timerCallback() {
-    if(_first_odom){
-        std_msgs::msg::Float32MultiArray motor_vel;
-        motor_vel.data.resize( _motor_num );
-    
-        if(_cmd_p[2]<=-0.2 && !_armed){
-            publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-            arm();
+    if(_first_odom && _controller_initialized){
+        if(_auto_hover_enabled && !_armed) {
             _armed = true;
-        }
-        // else if(_cmd_p[2]>-0.2 && _ref_p[2]>-0.2 && _armed && _new_plan){
-        //     disarm();
-        //     _armed = false;
-        // }
-        if(_new_plan){
-            publish_offboard_control_mode();
-            publish_thrust_setpoint(_thrust_normalized); 
-            publish_torque_setpoint(_torque_normalized);
-        }
-        else{
-            publish_offboard_control_mode();
-            publish_thrust_setpoint(0.1); 
-            publish_torque_setpoint(Eigen::Vector3d(0.0, 0.0, 0.0));
+            RCLCPP_INFO(this->get_logger(), "Controller AUTO-ARMED");
         }
         
+        if(_new_plan && _cmd_p[2] <= -0.5 && !_armed){
+            _armed = true;
+            RCLCPP_INFO(this->get_logger(), "Controller armed - explicit command");
+        }
+        
+        if(_armed && (_auto_hover_enabled || _new_plan)){            
+            publish_motor_commands(_omega_motor);
+        }
+        else {
+            Eigen::VectorXd zero_commands = Eigen::VectorXd::Zero(_motor_num);
+            publish_motor_commands(zero_commands);
+        }
     }
     else{
-        RCLCPP_INFO(this->get_logger(), "WAITING FOR ODOM...");
+        Eigen::VectorXd zero_commands = Eigen::VectorXd::Zero(_motor_num);
+        publish_motor_commands(zero_commands);
     }
 }
 
 /**
- * @brief Publish vehicle commands
- * @param command   Command code (matches VehicleCommand and MAVLink MAV_CMD codes)
- * @param param1    Command parameter 1
- * @param param2    Command parameter 2
+ * @brief Publish motor commands using actuator_msgs
+ * @param motor_velocities   Motor velocity commands in [rad/s]
  */
-void CONTROLLER::publish_vehicle_command(uint16_t command, float param1, float param2)
-{
-	px4_msgs::msg::VehicleCommand msg{};
-	msg.param1 = param1;
-	msg.param2 = param2;
-	msg.command = command;
-	msg.target_system = 1;
-	msg.target_component = 1;
-	msg.source_system = 1;
-	msg.source_component = 1;
-	msg.from_external = true;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	_vehicle_command_publisher->publish(msg);
-}
-
-/**
- * @brief Send a command to Arm the vehicle
- */
-void CONTROLLER::arm(){
-	publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
-
-	RCLCPP_INFO(this->get_logger(), "Arm command send");
-}
-
-/**
- * @brief Send a command to Disarm the vehicle
- */
-void CONTROLLER::disarm(){
-	publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
-
-	RCLCPP_INFO(this->get_logger(), "Disarm command send");
-}
-
-void CONTROLLER::publish_thrust_setpoint(float thrust){
-	px4_msgs::msg::VehicleThrustSetpoint msg{};
+void CONTROLLER::publish_motor_commands(const Eigen::VectorXd& motor_velocities) {
+    actuator_msgs::msg::Actuators msg;
     
-	msg.xyz[0] = 0;
-    msg.xyz[1] = 0;
-    msg.xyz[2] = thrust;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	_vehicle_thrust_sp_publisher->publish(msg);
-}
-
-void CONTROLLER::publish_torque_setpoint(Eigen::Vector3d torque)
-{
-	px4_msgs::msg::VehicleTorqueSetpoint msg{};
+    msg.header.stamp = this->get_clock()->now();
+    msg.header.frame_id = _model_name;
     
-	msg.xyz[0] = torque[0];
-    msg.xyz[1] = torque[1];
-    msg.xyz[2] = torque[2];
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	_vehicle_torque_sp_publisher->publish(msg);
-}
-
-void CONTROLLER::publish_offboard_control_mode()
-{
-    px4_msgs::msg::OffboardControlMode msg{};
-    msg.position = false;
-    msg.velocity = false;
-    msg.acceleration = false;
-    msg.body_rate = false;
-    msg.attitude = false;
-    msg.actuator = true;
-    msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-    _offboard_control_mode_publisher->publish(msg);
+    // Use velocity field for motor speed control in [rad/s]
+    msg.velocity.resize(_motor_num);
+    
+    for(int i = 0; i < _motor_num; i++) {
+        double raw_velocity = motor_velocities[i];
+        
+        // Safety checks for numerical stability
+        if(std::isnan(raw_velocity) || std::isinf(raw_velocity)) {
+            RCLCPP_WARN(this->get_logger(), "NaN/Inf detected in motor %d command, setting to 0", i);
+            raw_velocity = 0.0;
+        }
+        
+        // Conservative clamping based on updated SDF maxRotVelocity
+        double safe_max = _max_motor_velocity;  // Now 1885 rad/s from SDF
+        double clamped_velocity = std::max(0.0, std::min(raw_velocity, safe_max));
+        
+        msg.velocity[i] = clamped_velocity;
+    }    
+    _motor_command_publisher->publish(msg);
 }
 
 void CONTROLLER::request_new_plan() {
     float set_x, set_y, set_z, set_yaw;
+    _new_plan = false;  // Start with no active plan
+    
     while(rclcpp::ok()) {
         cout << "Insert new coordinates x (front), y (right), z (downword), yaw (clowise)" <<endl;
         scanf("%f %f %f %f", &set_x, &set_y, &set_z, &set_yaw);
-        cout << "Request new plan for: [" << set_x << ", " << set_y << ", " << set_z << " - " << set_yaw << "]" << endl;
 
-        //---ENU -> NED
         _cmd_p << set_x, set_y, set_z;
         _yaw_cmd = set_yaw;
-        //---
         _new_plan = true;
+        
+        if(_auto_hover_enabled) {
+            _auto_hover_enabled = false;
+            RCLCPP_INFO(this->get_logger(), "Auto-hover DISABLED - switching to explicit command mode");
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "New plan: cmd_p=[%.2f, %.2f, %.2f], yaw=%.2f°", 
+                   _cmd_p[0], _cmd_p[1], _cmd_p[2], _yaw_cmd * 180.0 / M_PI);
     }
-    _new_plan = false;
 }  
 
 bool generate_allocation_matrix(Eigen::MatrixXd & allocation_M, 
@@ -356,7 +355,17 @@ bool generate_allocation_matrix(Eigen::MatrixXd & allocation_M,
                                     vector<double> arm_length, 
                                     double force_k,
                                     double moment_k,
-                                    vector<int> direction ) {
+                                    vector<double> direction ) {  // Changed from vector<int> to vector<double>
+
+    if(motor_size <= 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Invalid motor_size: %d", motor_size);
+        return false;
+    }
+    
+    if(rotor_angle.size() != motor_size || arm_length.size() != motor_size || direction.size() != motor_size) {
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Vector size mismatch: motor_size=%d", motor_size);
+        return false;
+    }
 
     allocation_M.resize(4, motor_size );
 
@@ -367,9 +376,9 @@ bool generate_allocation_matrix(Eigen::MatrixXd & allocation_M,
         allocation_M(3, i) = -force_k;
     }
     
-    Eigen::FullPivLU<Eigen::Matrix4Xd> lu( allocation_M);
+    Eigen::FullPivLU<Eigen::MatrixXd> lu( allocation_M);
     if ( lu.rank() < 4 ) {
-        cout<<"The allocation matrix rank is lower than 4. This matrix specifies a not fully controllable system, check your configuration"<<endl;
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Allocation matrix rank < 4: system not fully controllable");
         return false;
     }
 
@@ -403,9 +412,8 @@ void CONTROLLER::ffilter(){
     rclcpp::Rate r(_rate);
     double ref_T = 1.0/(double)_rate;
 
-    _cmd_p << _mes_p(0), _mes_p(1), _mes_p(2);
-    _ref_p = _cmd_p;
-
+    _ref_p = _mes_p;
+    
     Vector3d ddp;
     ddp << 0.0, 0.0, 0.0;
     Vector3d dp;  
@@ -427,7 +435,14 @@ void CONTROLLER::ffilter(){
     jerk << 0.0, 0.0, 0.0;
             
     while( rclcpp::ok() ) {
-        ep = _cmd_p - _ref_p;
+        // Process commands based on mode: explicit new plan OR auto-hover
+        if(_new_plan || _auto_hover_enabled) {
+            // Either explicit user command OR auto-hover mode - track command position
+            ep = _cmd_p - _ref_p;
+        } else {
+            // No active mode - keep reference stationary
+            ep << 0.0, 0.0, 0.0;
+        }
 
         double eyaw = _yaw_cmd - _ref_yaw;
 
@@ -499,33 +514,15 @@ void CONTROLLER::ctrl_loop() {
 
     rclcpp::Rate r(_ctrl_rate);
 
-    //---Input
-    Eigen::Vector3d des_p;              
-    Eigen::Vector3d des_dp; 
-    Eigen::Vector3d des_ddp; 
-    des_dp << 0.0, 0.0, 0.0;
-    des_ddp << 0.0, 0.0, 0.0;
-
-    Eigen::Vector4d mes_q;
-    Eigen::Vector3d mes_dp;    
-    Eigen::Vector3d mes_w;
-
-    //---
-
     Eigen::MatrixXd allocation_M;
     Eigen::MatrixXd wd2rpm;
     
     while( !_first_odom ) usleep(0.1*1e6);
     
     if(!generate_allocation_matrix( allocation_M, _motor_num, _rotor_angles, _arm_length, _motor_force_k, _motor_moment_k, _motor_rotation_direction ) ) {     
-        cout << "Wrong allocation matrix" << endl;
+        RCLCPP_ERROR(this->get_logger(), "Failed to generate allocation matrix");
         exit(0);
     }
-
-    // ----- max thrust and torque computation
-        _max_wrench << 2.8198, 2.8198, 0.8480, 28.2656;
-        cout<<"Vector of maximum command wrench: "<<_max_wrench.transpose()<<endl;
-    // ---------------------------------------
 
     boost::thread input_t( &CONTROLLER::request_new_plan, this);
     boost::thread ffilter_t(&CONTROLLER::ffilter, this);
@@ -540,40 +537,74 @@ void CONTROLLER::ctrl_loop() {
     lc.set_uav_dynamics( _motor_num, _mass, _gravity, I);
     lc.set_controller_gains( _position_gain, _velocity_gain, _attitude_gain, _angular_rate_gain );
     lc.set_allocation_matrix( allocation_M );
+    
+    _controller_initialized = true;
+    RCLCPP_INFO(this->get_logger(), "Controller fully initialized - allocation matrix ready");
      
     Eigen::VectorXd ref_rotor_velocities;
     Eigen::Vector4d ft;
-    
-    Vector3d att_err;
+    Eigen::Vector3d att_err;
 
     while( rclcpp::ok() ) {
-        //Measured    
-        mes_q = _att_q;
-        mes_w = _omega_mes;          
-        Eigen::Matrix3d mes_R = utilities::QuatToMat( mes_q );
     
-        lc.controller(_mes_p, _ref_p, mes_R, _mes_dp, _ref_dp, _ref_ddp, _ref_yaw, _ref_dyaw, mes_w, &ref_rotor_velocities, &ft, &_perror, &_verror, &att_err);   
-        if(ft[3]<-_max_thrust){
-            ft[3]=-_max_thrust;
-        }
-        if(_ref_p(2)>-0.05 && _cmd_p(2)>-0.3){
-            ft<< 0,0,0,0;
-        }
+        // Only run controller when armed AND (we have an active plan OR auto-hover is enabled)
+        if(_armed && (_new_plan || _auto_hover_enabled)) {
+                        
+            lc.controller(_mes_p, _ref_p, _R_mes, _mes_dp, _ref_dp, _ref_ddp, _ref_yaw, _ref_dyaw, _omega_mes, &ref_rotor_velocities, &ft, &_perror, &_verror, &att_err);   
+                        
+            // Safety checks for controller output
+            for(int i = 0; i < 4; i++) {
+                if(std::isnan(ft[i]) || std::isinf(ft[i])) {
+                    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                        "NaN/Inf detected in force/torque %d, emergency stop", i);
+                    ft << 0, 0, 0, 0;  // Emergency stop
+                    break;
+                }
+            }
+            
+            if(ft[3]<-_max_thrust){
+                ft[3]=-_max_thrust;
+            }
+            
+            Eigen::VectorXd raw_motor_vels = ref_rotor_velocities;
 
-        _thrust_normalized = ft(3) / _max_wrench(3);
-        _thrust_normalized = std::clamp(_thrust_normalized, -1.0f, 0.0f);
-
-        _torque_normalized(0) = ft(0) / _max_wrench(0);
-        _torque_normalized(1) = ft(1) / _max_wrench(1);
-        _torque_normalized(2) = ft(2) / _max_wrench(2);
-
-        for(int i = 0; i < 3; i++) {
-            _torque_normalized(i) = std::clamp(_torque_normalized(i), -1.0, 1.0);
+            for(int i=0; i<_motor_num; i++ ) {
+                // Safety check for motor velocities
+                double motor_vel = ref_rotor_velocities[i];
+                if(std::isnan(motor_vel) || std::isinf(motor_vel)) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                        "NaN/Inf in motor velocity %d, resetting to 0", i);
+                    motor_vel = 0.0;
+                }
+                
+                // Conservative clamping based on SDF maxRotVelocity (1885 rad/s)
+                double safe_max = _max_motor_velocity;  // Now 1885 rad/s from updated SDF
+                motor_vel = std::max(0.0, std::min(motor_vel, safe_max));
+                
+                // CONSERVATIVE rate limiting: small changes per iteration for stability
+                double max_change = 50.0;  // Very conservative - only 50 rad/s change per cycle
+                double current_vel = _omega_motor[i];
+                double vel_diff = motor_vel - current_vel;
+                if(fabs(vel_diff) > max_change) {
+                    motor_vel = current_vel + (vel_diff > 0 ? max_change : -max_change);
+                }
+                
+                // Strong low-pass filter (alpha = 0.8 for very smooth transitions)
+                double alpha = 0.8;  // Increased from 0.3 to 0.8 for more filtering
+                _omega_motor[i] = alpha * _omega_motor[i] + (1.0 - alpha) * motor_vel;
+            }
+            
+        } else {
+            // When not armed or no active plan, gradually reduce motor speeds to zero
+            for(int i=0; i<_motor_num; i++ ) {
+                _omega_motor[i] *= 0.95;  // Gradually decay to zero
+                if(_omega_motor[i] < 1.0) _omega_motor[i] = 0.0;  // Complete stop when very low
+            }
+            
+            // Reset force/torque outputs
+            ft << 0, 0, 0, 0;
         }
-
-        for(int i=0; i<_motor_num; i++ ) {
-            _omega_motor[i] = ref_rotor_velocities[i]; 
-        }
+        
         r.sleep();
     }   
 }
