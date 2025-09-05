@@ -3,7 +3,7 @@ geometric_tracking_controller:
     use_sim_time: true
     
     model_name: "fpv_drone"
-    namespace: "quadrotor"
+    namespace: "fpv_uav"
     
     control_rate: 100.0
     rate: 100.0

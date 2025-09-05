@@ -215,8 +215,8 @@ CONTROLLER::CONTROLLER() : Node("geometric_tracking_controller"), _first_odom(fa
     declare_parameter("namespace", "quadrotor");  // Default to match SDF robotNamespace
     _namespace = this->get_parameter("namespace").as_string();
     
-    // Ground-truth odometry from frame converter (already in FRD frame)
-    std::string odom_topic = "/quadrotor/odometry_frd";
+    // Ground-truth odometry from frame converter (already in FRD frame) - use dynamic namespace
+    std::string odom_topic = "/" + _namespace + "/odometry_frd";
     _odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, qos, 
         std::bind(&CONTROLLER::odom_callback, this, std::placeholders::_1));
 
@@ -355,31 +355,70 @@ bool generate_allocation_matrix(Eigen::MatrixXd & allocation_M,
                                     vector<double> arm_length, 
                                     double force_k,
                                     double moment_k,
-                                    vector<double> direction ) {  // Changed from vector<int> to vector<double>
+                                    vector<double> direction ) {
 
     if(motor_size <= 0) {
-        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Invalid motor_size: %d", motor_size);
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "❌ Invalid motor_size: %d", motor_size);
         return false;
     }
     
     if(rotor_angle.size() != motor_size || arm_length.size() != motor_size || direction.size() != motor_size) {
-        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Vector size mismatch: motor_size=%d", motor_size);
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), 
+            "❌ Vector size mismatch: motor_size=%d, angles=%zu, arms=%zu, directions=%zu", 
+            motor_size, rotor_angle.size(), arm_length.size(), direction.size());
         return false;
     }
 
-    allocation_M.resize(4, motor_size );
+    // Allocation matrix: 4 controls (roll, pitch, yaw, thrust) × N motors
+    allocation_M.resize(4, motor_size);
 
-    for(int i=0; i<motor_size; i++ ) {
-        allocation_M(0, i) = sin( rotor_angle[i] ) * arm_length[i] * force_k;
-        allocation_M(1, i) = cos( rotor_angle[i] ) * arm_length[i] * force_k;
+    RCLCPP_INFO(rclcpp::get_logger("allocation"), 
+        "🔧 Generating allocation matrix for %d-motor multirotor", motor_size);
+
+    for(int i=0; i<motor_size; i++) {
+        // Roll moment: sin(angle) * arm_length * force_constant
+        allocation_M(0, i) = sin(rotor_angle[i]) * arm_length[i] * force_k;
+        
+        // Pitch moment: cos(angle) * arm_length * force_constant  
+        allocation_M(1, i) = cos(rotor_angle[i]) * arm_length[i] * force_k;
+        
+        // Yaw moment: direction * force_constant * moment_constant
         allocation_M(2, i) = direction[i] * force_k * moment_k;
+        
+        // Thrust: -force_constant (negative because z-down in FRD)
         allocation_M(3, i) = -force_k;
+        
+        RCLCPP_DEBUG(rclcpp::get_logger("allocation"), 
+            "Motor %d: angle=%.3f°, arm=%.3f, dir=%.0f → [%.6f, %.6f, %.6f, %.6f]",
+            i, rotor_angle[i]*180/M_PI, arm_length[i], direction[i],
+            allocation_M(0,i), allocation_M(1,i), allocation_M(2,i), allocation_M(3,i));
     }
     
-    Eigen::FullPivLU<Eigen::MatrixXd> lu( allocation_M);
-    if ( lu.rank() < 4 ) {
-        RCLCPP_ERROR(rclcpp::get_logger("allocation"), "Allocation matrix rank < 4: system not fully controllable");
+    // Analyze matrix properties for different configurations
+    Eigen::FullPivLU<Eigen::MatrixXd> lu(allocation_M);
+    int matrix_rank = lu.rank();
+    
+    RCLCPP_INFO(rclcpp::get_logger("allocation"), 
+        "📊 Allocation matrix rank: %d/%d (need rank=4 for full control)", 
+        matrix_rank, std::min(4, motor_size));
+    
+    if(matrix_rank < 4) {
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), 
+            "❌ Allocation matrix rank deficient (%d < 4): system not fully controllable", matrix_rank);
+        RCLCPP_ERROR(rclcpp::get_logger("allocation"), 
+            "💡 Possible causes: motors too aligned, identical positions, or insufficient motors");
         return false;
+    }
+    
+    // Log system type based on motor count
+    if(motor_size == 4) {
+        RCLCPP_INFO(rclcpp::get_logger("allocation"), "✅ Quadrotor configuration (exactly actuated)");
+    } else if(motor_size == 6) {
+        RCLCPP_INFO(rclcpp::get_logger("allocation"), "✅ Hexacopter configuration (over-actuated, fault tolerant)");
+    } else if(motor_size == 8) {
+        RCLCPP_INFO(rclcpp::get_logger("allocation"), "✅ Octocopter configuration (highly over-actuated, high fault tolerance)");
+    } else {
+        RCLCPP_INFO(rclcpp::get_logger("allocation"), "✅ %d-motor configuration (over-actuated)", motor_size);
     }
 
     return true;
@@ -539,7 +578,7 @@ void CONTROLLER::ctrl_loop() {
     lc.set_allocation_matrix( allocation_M );
     
     _controller_initialized = true;
-    RCLCPP_INFO(this->get_logger(), "Controller fully initialized - allocation matrix ready");
+    RCLCPP_INFO(this->get_logger(), "🚀 Controller fully initialized - allocation matrix ready for %d motors", _motor_num);
      
     Eigen::VectorXd ref_rotor_velocities;
     Eigen::Vector4d ft;
@@ -553,27 +592,32 @@ void CONTROLLER::ctrl_loop() {
             lc.controller(_mes_p, _ref_p, _R_mes, _mes_dp, _ref_dp, _ref_ddp, _ref_yaw, _ref_dyaw, _omega_mes, &ref_rotor_velocities, &ft, &_perror, &_verror, &att_err);   
                         
             // Safety checks for controller output
+            bool force_torque_valid = true;
             for(int i = 0; i < 4; i++) {
                 if(std::isnan(ft[i]) || std::isinf(ft[i])) {
                     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                        "NaN/Inf detected in force/torque %d, emergency stop", i);
-                    ft << 0, 0, 0, 0;  // Emergency stop
+                        "❌ NaN/Inf detected in force/torque %d, emergency stop", i);
+                    force_torque_valid = false;
                     break;
                 }
             }
             
-            if(ft[3]<-_max_thrust){
-                ft[3]=-_max_thrust;
+            if(!force_torque_valid) {
+                ft << 0, 0, 0, 0;  // Emergency stop
+                ref_rotor_velocities = Eigen::VectorXd::Zero(_motor_num);
             }
             
-            Eigen::VectorXd raw_motor_vels = ref_rotor_velocities;
-
-            for(int i=0; i<_motor_num; i++ ) {
+            if(ft[3] < -_max_thrust) {
+                ft[3] = -_max_thrust;
+            }
+            
+            // Apply motor commands with enhanced safety checks
+            for(int i=0; i<_motor_num; i++) {
                 // Safety check for motor velocities
                 double motor_vel = ref_rotor_velocities[i];
                 if(std::isnan(motor_vel) || std::isinf(motor_vel)) {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                        "NaN/Inf in motor velocity %d, resetting to 0", i);
+                        "⚠️  NaN/Inf in motor velocity %d, resetting to 0", i);
                     motor_vel = 0.0;
                 }
                 

@@ -1,6 +1,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "boost/thread.hpp"
 #include <Eigen/Eigen>
+#include <iostream>
 
 class LEE_CONTROLLER {
 

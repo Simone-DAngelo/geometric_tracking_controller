@@ -5,8 +5,58 @@ using namespace std;
 LEE_CONTROLLER::LEE_CONTROLLER() {}
 
 void LEE_CONTROLLER::set_allocation_matrix(  Eigen::MatrixXd allocation_M ) {
-  // _wd2rpm = allocation_M.transpose() * (allocation_M*allocation_M.transpose()).inverse();//*_I;   
-  _wd2rpm =  allocation_M.inverse();
+  // Store allocation matrix dimensions for validation
+  int n_motors = allocation_M.cols();
+  int n_controls = allocation_M.rows();  // Should be 4 (roll, pitch, yaw, thrust)
+  
+  // Log matrix characteristics
+  std::cout << "🔧 Allocation matrix: " << n_controls << "x" << n_motors 
+            << " (controls x motors)" << std::endl;
+  
+  if (n_controls != 4) {
+    std::cerr << "❌ ERROR: Allocation matrix must have 4 rows (roll, pitch, yaw, thrust)" << std::endl;
+    return;
+  }
+  
+  // For square matrices (4x4), use direct inverse for optimal performance
+  if (n_motors == 4 && allocation_M.determinant() != 0.0) {
+    _wd2rpm = allocation_M.inverse();
+    std::cout << "✅ Using direct inverse for 4x4 quadrotor allocation" << std::endl;
+  }
+  // For over-actuated systems (n_motors > 4), use pseudo-inverse (Moore-Penrose)
+  else if (n_motors > 4) {
+    // Compute pseudo-inverse: A⁺ = Aᵀ(AAᵀ)⁻¹
+    Eigen::MatrixXd AA_t = allocation_M * allocation_M.transpose();
+    
+    // Check if AA_t is invertible
+    Eigen::FullPivLU<Eigen::MatrixXd> lu(AA_t);
+    if (lu.rank() < 4) {
+      std::cerr << "❌ ERROR: Allocation matrix rank deficient (rank=" 
+                << lu.rank() << " < 4), system not fully controllable" << std::endl;
+      return;
+    }
+    
+    _wd2rpm = allocation_M.transpose() * AA_t.inverse();
+    std::cout << "✅ Using pseudo-inverse for " << n_motors 
+              << "-motor over-actuated system" << std::endl;
+  }
+  // For under-actuated systems (n_motors < 4) - not physically realizable for quadrotor control
+  else {
+    std::cerr << "❌ ERROR: Cannot control quadrotor with " << n_motors 
+              << " motors (need at least 4 for full control)" << std::endl;
+    return;
+  }
+  
+  // Validate the computed pseudo-inverse by checking reconstruction
+  Eigen::MatrixXd reconstruction_error = allocation_M * _wd2rpm - Eigen::Matrix4d::Identity();
+  double max_error = reconstruction_error.array().abs().maxCoeff();
+  
+  if (max_error > 1e-6) {
+    std::cout << "⚠️  WARNING: Pseudo-inverse reconstruction error = " << max_error 
+              << " (should be < 1e-6)" << std::endl;
+  } else {
+    std::cout << "✅ Pseudo-inverse validation successful (error = " << max_error << ")" << std::endl;
+  }
 }
 
 void LEE_CONTROLLER::set_uav_dynamics (int motor_num, double mass, double gravity, Eigen::Matrix4d I) {
